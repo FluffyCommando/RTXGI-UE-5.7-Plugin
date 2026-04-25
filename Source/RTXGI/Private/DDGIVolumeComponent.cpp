@@ -371,6 +371,15 @@ void FDDGIVolumeSceneProxy::ResetTextures_RenderThread(FRDGBuilder& GraphBuilder
 		uint32 StatesClearColor[] = { 0u, 0u, 0u, 0u };
 		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(GraphBuilder.RegisterExternalTexture(ProbesStates)), StatesClearColor);
 	}
+	if (ProbesSpace)
+    {
+        uint32 SpaceClearColor[] = { 0u, 0u, 0u, 0u };
+        AddClearUAVPass(
+            GraphBuilder,
+            GraphBuilder.CreateUAV(GraphBuilder.RegisterExternalTexture(ProbesSpace)),
+            SpaceClearColor
+        );
+    }
 }
 
 void FDDGIVolumeSceneProxy::HandlePreWorldFinishDestroy(UWorld* InWorld)
@@ -965,34 +974,11 @@ const FGuid FDDGICustomVersion::GUID(0xc12f0537, 0x7346d9c5, 0x336fbba3, 0x738ab
 FCustomVersionRegistration GRegisterCustomVersion(FDDGICustomVersion::GUID, FDDGICustomVersion::SaveLoadProbeDataIsOptional, TEXT("DDGIVolCompVer"));
 
 // Create a CPU accessible GPU texture and copy the provided GPU texture's contents to it
-static FDDGITexturePixels GetTexturePixelsStep1_RenderThread(FRHICommandListImmediate& RHICmdList, FRHITexture* textureGPU)
+static FDDGITexturePixels GetTexturePixelsStep1_RenderThread(
+    FRHICommandListImmediate& RHICmdList,
+    FRHITexture* textureGPU)
 {
-	FDDGITexturePixels ret;
-
-	// Early out if a GPU texture is not provided
-	if (!textureGPU) return ret;
-
-	ret.Desc.Width = textureGPU->GetTexture2D()->GetSizeX();
-	ret.Desc.Height = textureGPU->GetTexture2D()->GetSizeY();
-	ret.Desc.PixelFormat = (int32)textureGPU->GetFormat();
-
-	// Create the texture
-	FRHITextureCreateDesc CreateInfo = FRHITextureCreateDesc::Create2D(TEXT("DDGIGetTexturePixelsSave"), ret.Desc.Width,ret.Desc.Height, textureGPU->GetFormat());
-	CreateInfo.AddFlags(TexCreate_ShaderResource);
-
-	CreateInfo.InitialState = ERHIAccess::CopyDest;
-	ret.Texture = RHICreateTexture(CreateInfo);
-
-	// Transition the GPU texture to a copy source
-	RHICmdList.Transition(FRHITransitionInfo(textureGPU, ERHIAccess::SRVMask, ERHIAccess::CopySrc));
-
-	// Schedule a copy of the GPU texture to the CPU accessible GPU texture
-	RHICmdList.CopyTexture(textureGPU, ret.Texture, FRHICopyTextureInfo{});
-
-	// Transition the GPU texture back to general
-	RHICmdList.Transition(FRHITransitionInfo(textureGPU, ERHIAccess::CopySrc, ERHIAccess::SRVMask));
-
-	return ret;
+    return FDDGITexturePixels();
 }
 
 // Read the CPU accessible GPU texture data into CPU memory
@@ -1127,7 +1113,7 @@ void UDDGIVolumeComponent::Serialize(FArchive& Ar)
 				// When we are *not* cooking and ray tracing is available, copy the DDGIVolume probe texture resources
 				// to CPU memory otherwise, write out the DDGIVolume texture resources acquired at load time
 				// Also disable copying when we are static in editor
-				if (!Ar.IsCooking() && IsRayTracingEnabled() && proxy)
+				if (false && !Ar.IsCooking() && IsRayTracingEnabled() && proxy)
 				{
 					// Copy textures to CPU accessible texture resources
 					ENQUEUE_RENDER_COMMAND(DDGISaveTexStep1)(
@@ -1293,7 +1279,7 @@ void UDDGIVolumeComponent::UpdateRenderThreadData()
 				// Update the probe scroll offset count
 				ProbeScrollOffset.X += Translation.X;
 				ProbeScrollOffset.Y += Translation.Y;
-				ProbeScrollOffset.X += Translation.Z;
+				ProbeScrollOffset.Z += Translation.Z;
 			}
 
 			// Set the probe scroll offsets.
@@ -1343,31 +1329,60 @@ void UDDGIVolumeComponent::UpdateRenderThreadData()
 		FDDGITextureLoadContext TextureLoadContext = LoadContext;
 		LoadContext.ReadyForLoad = false;
 
+		const uint32 ThisUpdateSerial = ++RenderDataUpdateSerial;
+		TWeakObjectPtr<UDDGIVolumeComponent> WeakThis(this);
+
 		ENQUEUE_RENDER_COMMAND(UpdateGIVolumeTransformCommand)(
-			[DDGIProxy, ComponentData, TextureLoadContext, IrradianceBits, DistanceBits](FRHICommandListImmediate& RHICmdList)
+			[DDGIProxy, ComponentData, TextureLoadContext, IrradianceBits, DistanceBits, WeakThis, ThisUpdateSerial](FRHICommandListImmediate& RHICmdList)
 			{
+				if (!WeakThis.IsValid() || WeakThis->RenderDataUpdateSerial != ThisUpdateSerial)
+				{
+    				return;
+				}
 				FMemMark Mark(FMemStack::Get());
 				FRDGBuilder GraphBuilder(RHICmdList);
 		
 				bool needReallocate =
-					DDGIProxy->ComponentData.ProbeCounts != ComponentData.ProbeCounts ||
-					DDGIProxy->ComponentData.RaysPerProbe != ComponentData.RaysPerProbe ||
-					DDGIProxy->ComponentData.EnableProbeRelocation != ComponentData.EnableProbeRelocation;
-		
-				// Now assign the new data
-				DDGIProxy->ComponentData = ComponentData;
+   					DDGIProxy->ComponentData.ProbeCounts != ComponentData.ProbeCounts ||
+    				DDGIProxy->ComponentData.RaysPerProbe != ComponentData.RaysPerProbe ||
+    				DDGIProxy->ComponentData.EnableProbeRelocation != ComponentData.EnableProbeRelocation ||
+    				DDGIProxy->ComponentData.EnableProbeScrolling != ComponentData.EnableProbeScrolling;
 		
 				// Handle state textures ready to load from serialization
 				if (TextureLoadContext.ReadyForLoad)
-					DDGIProxy->TextureLoadContext = TextureLoadContext;
-		
+				{
+				    DDGIProxy->TextureLoadContext = TextureLoadContext;
+				}
 				if (needReallocate)
 				{
-					DDGIProxy->ReallocateSurfaces_RenderThread(RHICmdList, IrradianceBits, DistanceBits);
-					DDGIProxy->ResetTextures_RenderThread(GraphBuilder);
-					FDDGIVolumeSceneProxy::AllProxiesReadyForRender_RenderThread.Add(DDGIProxy);
+				    FDDGIVolumeSceneProxy::AllProxiesReadyForRender_RenderThread.Remove(DDGIProxy);
+				
+				    DDGIProxy->ComponentData = ComponentData;
+				
+				    DDGIProxy->ProbeIndexStart = 0;
+				    DDGIProxy->ProbeIndexCount = 0;
+				
+				    DDGIProxy->ReallocateSurfaces_RenderThread(RHICmdList, IrradianceBits, DistanceBits);
+				    DDGIProxy->ResetTextures_RenderThread(GraphBuilder);
+				
+				    GraphBuilder.Execute();
+				
+				    ENQUEUE_RENDER_COMMAND(ReAddDDGIProxyAfterResize)(
+				    [DDGIProxy, WeakThis, ThisUpdateSerial](FRHICommandListImmediate& RHICmdList)
+				    {
+				        if (!WeakThis.IsValid() || WeakThis->RenderDataUpdateSerial != ThisUpdateSerial)
+				        {
+				            return;
+				        }
+				
+				        DDGIProxy->ProbeIndexStart = 0;
+				        DDGIProxy->ProbeIndexCount = 0;
+				        FDDGIVolumeSceneProxy::AllProxiesReadyForRender_RenderThread.Add(DDGIProxy);
+				    }
+				);
+				    return;
 				}
-		
+				DDGIProxy->ComponentData = ComponentData;
 				GraphBuilder.Execute();
 			}
 		);

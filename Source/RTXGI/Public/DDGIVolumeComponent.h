@@ -520,4 +520,5 @@ public:
 	FVector3f LastOrigin = FVector3f{ 0.0f, 0.0f, 0.0f };
 #endif
 	FIntVector ProbeScrollOffset = FIntVector{ 0, 0, 0 };
+	uint32 RenderDataUpdateSerial = 0;
 };
